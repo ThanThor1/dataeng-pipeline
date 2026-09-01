@@ -1,0 +1,354 @@
+# dataeng-pipeline/docker-compose.yml
+
+services:
+  # ============================================
+  # KAFKA (KRaft mode - không cần Zookeeper)
+  # ============================================
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka
+    hostname: kafka
+    ports:
+      - "${KAFKA_LISTENER_PORT}:9092"   # Port cho client bên ngoài (host) kết nối
+    environment:
+      # --- Định danh node trong cluster KRaft ---
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+
+      # --- Khai báo 2 listener: nội bộ Docker network và bên ngoài ---
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      # --- Cấu hình cluster (chỉ 1 broker nên replication = 1) ---
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      # --- KRaft cluster ID (tự sinh 1 lần, giữ cố định) ---
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+
+      # --- Cho phép tự động tạo topic khi producer gửi vào topic chưa tồn tại ---
+      # (Dev thì để true cho tiện, Production nên để false và tạo topic thủ công)
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    networks:
+      - dataeng_network
+
+  # UI để nhìn Kafka topic/message trực quan (không bắt buộc nhưng RẤT nên có)
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local-dataeng
+      KAFKA_CLUSTERS_0_BOOTSTRASERVER: kafka:29092
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    networks:
+      - dataeng_network
+
+  # ============================================
+  # MINIO (S3-compatible object storage)
+  # ============================================
+  minio:
+    image: minio/minio:RELEASE.2024-06-13T22-53-53Z
+    container_name: minio
+    hostname: minio
+    ports:
+      - "${MINIO_API_PORT}:9000"      # API endpoint (S3 protocol)
+      - "${MINIO_CONSOLE_PORT}:9001"  # Web UI
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+    networks:
+      - dataeng_network
+
+  # Job chạy 1 lần để tự động tạo bucket bronze/silver/gold khi MinIO vừa lên
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./docker/minio/init-buckets.sh:/init-buckets.sh
+    entrypoint: ["/bin/sh", "/init-buckets.sh"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_ENDPOINT_INTERNAL: ${MINIO_ENDPOINT_INTERNAL}
+      MINIO_BUCKET_BRONZE: ${MINIO_BUCKET_BRONZE}
+      MINIO_BUCKET_SILVER: ${MINIO_BUCKET_SILVER}
+      MINIO_BUCKET_GOLD: ${MINIO_BUCKET_GOLD}
+    networks:
+      - dataeng_network
+  # ============================================
+  # SPARK (Structured Streaming: Kafka -> Bronze trên MinIO)
+  # ============================================
+  spark-master:
+    build:
+      context: ./docker/spark
+      dockerfile: Dockerfile
+    container_name: spark-master
+    hostname: spark-master
+    entrypoint: ["/opt/spark/bin/spark-class"]
+    command: ["org.apache.spark.deploy.master.Master", "--host", "spark-master", "--port", "7077", "--webui-port", "8080"]
+    ports:
+      - "7077:7077"     # Spark master RPC port (worker kết nối vào đây)
+      - "8081:8080"     # Spark master Web UI
+    volumes:
+      - ./spark_jobs:/opt/spark_apps
+      - spark_data:/opt/spark/work
+    networks:
+      - dataeng_network
+  spark-worker:
+    build:
+      context: ./docker/spark
+      dockerfile: Dockerfile
+    container_name: spark-worker
+    hostname: spark-worker
+    depends_on:
+      - spark-master
+    entrypoint: ["/opt/spark/bin/spark-class"]
+    command: ["org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    environment:
+      SPARK_WORKER_MEMORY: 6G
+      SPARK_WORKER_CORES: 6
+      SPARK_WORKER_OPTS: "-Dspark.shuffle.service.enabled=true -Dspark.shuffle.service.port=7337"
+    volumes:
+      - ./spark_jobs:/opt/spark_apps
+    networks:
+      - dataeng_network
+  # ============================================
+  # STREAMING JOBS: Kafka -> Bronze (mỗi topic 1 service riêng)
+  # ============================================
+  orders-to-bronze:
+    build:
+      context: ./docker/spark
+      dockerfile: Dockerfile
+    container_name: orders-to-bronze
+
+    depends_on:
+      - spark-master
+      - spark-worker
+    env_file:
+      - .env
+    volumes:
+      - ./spark_jobs:/opt/spark_apps
+    command: >
+      /opt/spark/bin/spark-submit
+      --master spark://spark-master:7077
+      --executor-memory 512m
+      --conf spark.executor.cores=1
+      --conf spark.dynamicAllocation.enabled=true
+      --conf spark.dynamicAllocation.shuffleTracking.enabled=true
+      --conf spark.shuffle.service.enabled=true
+      --conf spark.dynamicAllocation.minExecutors=0
+      --conf spark.dynamicAllocation.maxExecutors=2
+      --conf spark.dynamicAllocation.executorIdleTimeout=30s
+      /opt/spark_apps/bronze/orders_to_bronze.py
+    restart: unless-stopped
+    networks:
+      - dataeng_network
+
+  payments-to-bronze:
+    build:
+      context: ./docker/spark
+      dockerfile: Dockerfile
+    container_name: payments-to-bronze
+    depends_on:
+      - spark-master
+      - spark-worker
+    env_file:
+      - .env
+    volumes:
+      - ./spark_jobs:/opt/spark_apps
+    command: >
+      /opt/spark/bin/spark-submit
+      --master spark://spark-master:7077
+      --executor-memory 512m
+      --conf spark.executor.cores=1
+      --conf spark.dynamicAllocation.enabled=true
+      --conf spark.dynamicAllocation.shuffleTracking.enabled=true
+      --conf spark.shuffle.service.enabled=true
+      --conf spark.dynamicAllocation.minExecutors=0
+      --conf spark.dynamicAllocation.maxExecutors=2
+      --conf spark.dynamicAllocation.executorIdleTimeout=30s
+      /opt/spark_apps/bronze/payments_to_bronze.py
+    restart: unless-stopped
+    networks:
+      - dataeng_network
+
+  inventory-to-bronze:
+    build:
+      context: ./docker/spark
+      dockerfile: Dockerfile
+    container_name: inventory-to-bronze
+    depends_on:
+      - spark-master
+      - spark-worker
+    env_file:
+      - .env
+    volumes:
+      - ./spark_jobs:/opt/spark_apps
+    command: >
+      /opt/spark/bin/spark-submit
+      --master spark://spark-master:7077
+      --executor-memory 512m
+      --conf spark.executor.cores=1
+      --conf spark.dynamicAllocation.enabled=true
+      --conf spark.dynamicAllocation.shuffleTracking.enabled=true
+      --conf spark.shuffle.service.enabled=true
+      --conf spark.dynamicAllocation.minExecutors=0
+      --conf spark.dynamicAllocation.maxExecutors=2
+      --conf spark.dynamicAllocation.executorIdleTimeout=30s
+      /opt/spark_apps/bronze/inventory_to_bronze.py
+    restart: unless-stopped
+    networks:
+      - dataeng_network
+
+  customers-to-bronze:
+    build:
+      context: ./docker/spark
+      dockerfile: Dockerfile
+    container_name: customers-to-bronze
+    depends_on:
+      - spark-master
+      - spark-worker
+    env_file:
+      - .env
+    volumes:
+      - ./spark_jobs:/opt/spark_apps
+    command: >
+      /opt/spark/bin/spark-submit
+      --master spark://spark-master:7077
+      --executor-memory 512m
+      --conf spark.executor.cores=1
+      --conf spark.dynamicAllocation.enabled=true
+      --conf spark.dynamicAllocation.shuffleTracking.enabled=true
+      --conf spark.shuffle.service.enabled=true
+      --conf spark.dynamicAllocation.minExecutors=0
+      --conf spark.dynamicAllocation.maxExecutors=2
+      --conf spark.dynamicAllocation.executorIdleTimeout=30s
+      /opt/spark_apps/bronze/customers_to_bronze.py
+    restart: unless-stopped
+    networks:
+      - dataeng_network
+  orders-cleaning:
+    build:
+      context: ./docker/spark
+      dockerfile: Dockerfile
+    container_name: orders-cleaning
+    depends_on:
+      - spark-master
+      - spark-worker
+    env_file:
+      - .env
+    volumes:
+      - ./spark_jobs:/opt/spark_apps
+    command: >
+      /opt/spark/bin/spark-submit
+      --master spark://spark-master:7077
+      --executor-memory 512m
+      --conf spark.executor.cores=1
+      --conf spark.dynamicAllocation.enabled=true
+      --conf spark.dynamicAllocation.shuffleTracking.enabled=true
+      --conf spark.shuffle.service.enabled=true
+      --conf spark.dynamicAllocation.minExecutors=0
+      --conf spark.dynamicAllocation.maxExecutors=2
+      --conf spark.dynamicAllocation.executorIdleTimeout=30s
+      /opt/spark_apps/silver/orders_cleaning.py
+    restart: unless-stopped
+    networks:
+      - dataeng_network
+  payments-cleaning:
+    build:
+      context: ./docker/spark
+      dockerfile: Dockerfile
+    container_name: payments-cleaning
+    depends_on:
+      - spark-master
+      - spark-worker
+    env_file:
+      - .env
+    volumes:
+      - ./spark_jobs:/opt/spark_apps
+    command: >
+      /opt/spark/bin/spark-submit
+      --master spark://spark-master:7077
+      --executor-memory 512m
+      --conf spark.executor.cores=1
+      --conf spark.dynamicAllocation.enabled=true
+      --conf spark.dynamicAllocation.shuffleTracking.enabled=true
+      --conf spark.shuffle.service.enabled=true
+      --conf spark.dynamicAllocation.minExecutors=0
+      --conf spark.dynamicAllocation.maxExecutors=2
+      --conf spark.dynamicAllocation.executorIdleTimeout=30s
+      /opt/spark_apps/silver/payments_cleaning.py
+    restart: unless-stopped
+    networks:
+      - dataeng_network
+
+  inventory-cleaning:
+    build:
+      context: ./docker/spark
+      dockerfile: Dockerfile
+    container_name: inventory-cleaning
+    depends_on:
+      - spark-master
+      - spark-worker
+    env_file:
+      - .env
+    volumes:
+      - ./spark_jobs:/opt/spark_apps
+    command: >
+      /opt/spark/bin/spark-submit
+      --master spark://spark-master:7077
+      --executor-memory 512m
+      --conf spark.executor.cores=1
+      --conf spark.dynamicAllocation.enabled=true
+      --conf spark.dynamicAllocation.shuffleTracking.enabled=true
+      --conf spark.shuffle.service.enabled=true
+      --conf spark.dynamicAllocation.minExecutors=0
+      --conf spark.dynamicAllocation.maxExecutors=2
+      --conf spark.dynamicAllocation.executorIdleTimeout=30s
+      /opt/spark_apps/silver/inventory_cleaning.py
+    restart: unless-stopped
+    networks:
+      - dataeng_network
+networks:
+  dataeng_network:
+    name: dataeng_network
+    driver: bridge
+
+volumes:
+  kafka_data:
+    name: dataeng_kafka_data
+  minio_data:
+    name: dataeng_minio_data
+  spark_data:
+    name: dataeng_spark_data

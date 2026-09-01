@@ -1,0 +1,26 @@
+# dataeng-pipeline/.gitignore
+
+.env
+*.log
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Docker volumes data (nếu bind-mount ra thư mục local)
+docker/kafka/data/
+docker/minio/data/
+
+# Airflow (sẽ cần ở giai đoạn E)
+airflow/logs/
+airflow/plugins/__pycache__/
+
+# dbt (giai đoạn F)
+dbt_project/target/
+dbt_project/dbt_packages/
+dbt_project/logs/
+dbt_project/profiles.yml
+
+# IDE
+.vscode/
+.idea/
