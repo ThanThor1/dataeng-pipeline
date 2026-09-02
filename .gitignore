@@ -24,3 +24,7 @@ dbt_project/profiles.yml
 # IDE
 .vscode/
 .idea/
+
+# Airflow
+airflow/logs/
+airflow/plugins/__pycache__/
